@@ -1,0 +1,130 @@
+#include <WiFi.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <FirebaseClient.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ------------------- WIFI CONFIG -------------------
+#define WIFI_SSID "YOUR_WIFI_NAME"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+// ------------------- FIREBASE CONFIG -------------------
+#define DATABASE_URL "https://nasa-buoy-project-default-rtdb.europe-west1.firebasedatabase.app"
+#define API_KEY "YOUR_API_KEY"
+
+// ------------------- LORA CONFIG -------------------
+#define LORA_SCK 5
+#define LORA_MISO 19
+#define LORA_MOSI 27
+#define LORA_CS 18
+#define LORA_RST 14
+#define LORA_IRQ 26
+#define LORA_BAND 915E6  // Change to your region: 433E6, 868E6, 915E6
+
+// ------------------- TEMP SENSOR CONFIG -------------------
+#define ONE_WIRE_BUS 4  // GPIO where DS18B20 is connected
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature tempSensor(&oneWire);
+
+Adafruit_MPU6050 mpu;
+
+// Firebase objects
+using namespace firebase;
+using namespace firebase::database;
+using namespace firebase::auth;
+
+DefaultNetwork network;
+FirebaseApp app;
+RealtimeDatabase db;
+UserAuth userAuth;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  // ---------------- WIFI ----------------
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi connected!");
+
+  // ---------------- Firebase ----------------
+  Serial.println("Initializing Firebase...");
+  app.setConfig(API_KEY);
+  app.begin(&network, &userAuth);
+  db.url(DATABASE_URL);
+  Serial.println("Firebase Ready!");
+
+  // ---------------- MPU ----------------
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip");
+    while (1) { delay(10); }
+  }
+  Serial.println("MPU6050 Found!");
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // ---------------- LoRa ----------------
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_IRQ);
+  if (!LoRa.begin(LORA_BAND)) {
+    Serial.println("Starting LoRa failed!");
+    while (1);
+  }
+  Serial.println("LoRa Initialized.");
+
+  // ---------------- Temperature Sensor ----------------
+  tempSensor.begin();
+  Serial.println("Temperature sensor ready!");
+}
+
+void loop() {
+  // Read MPU6050 data
+  sensors_event_t a, g, tempMPU;
+  mpu.getEvent(&a, &g, &tempMPU);
+
+  // Read DS18B20 temperature
+  tempSensor.requestTemperatures(); 
+  float waterTemp = tempSensor.getTempCByIndex(0); // in Celsius
+
+  // Prepare payload
+  String payload = "";
+  payload += "Accel: X=" + String(a.acceleration.x, 2) + " Y=" + String(a.acceleration.y, 2) + " Z=" + String(a.acceleration.z, 2);
+  payload += " | Gyro: X=" + String(g.gyro.x, 2) + " Y=" + String(g.gyro.y, 2) + " Z=" + String(g.gyro.z, 2);
+  payload += " | Temp: " + String(waterTemp, 2) + "C";
+
+  // Send via LoRa
+  LoRa.beginPacket();
+  LoRa.print(payload);
+  LoRa.endPacket();
+  Serial.println("Sent via LoRa: " + payload);
+
+  // Push data to Firebase
+  FirebaseJson json;
+  json.set("accel_x", a.acceleration.x);
+  json.set("accel_y", a.acceleration.y);
+  json.set("accel_z", a.acceleration.z);
+  json.set("gyro_x", g.gyro.x);
+  json.set("gyro_y", g.gyro.y);
+  json.set("gyro_z", g.gyro.z);
+  json.set("water_temperature", waterTemp); // <-- new field
+  json.set("timestamp", millis());
+
+  String path = "/sensorData";
+  auto result = db.push(&app, path.c_str(), json.raw());
+  if (result.httpCode() == 200) {
+    Serial.println(" Data sent to Firebase!");
+  } else {
+    Serial.printf(" Firebase error: %d\n", result.httpCode());
+  }
+
+  delay(1000);  // 1 second delay
+}
