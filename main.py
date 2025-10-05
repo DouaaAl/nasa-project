@@ -19,16 +19,29 @@ except:
 
 def fetch_sensor_data():
     """Fetch sensor data from Firebase and return as DataFrame."""
-    response = requests.get(FIREBASE_SENSOR_URL)
-    data = response.json()
+    try:
+        response = requests.get(FIREBASE_SENSOR_URL, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as e:
+        print("Failed to fetch sensor data:", e)
+        return pd.DataFrame()
+    
     if not data:
         return pd.DataFrame()
-    df = pd.DataFrame(data).transpose()  # Convert JSON dict to DataFrame
-    expected_columns = ['temperature','ax','ay','az','gx','gy','gz']
+    
+    df = pd.DataFrame(data).transpose()
+    
+    # Some data uses 'prediction_temp' instead of 'temperature'
+    if 'temperature' not in df.columns and 'prediction_temp' in df.columns:
+        df['temperature'] = df['prediction_temp']
+    
     # Ensure all expected columns exist
+    expected_columns = ['temperature','ax','ay','az','gx','gy','gz']
     for col in expected_columns:
         if col not in df.columns:
             df[col] = 0.0
+    
     return df
 
 def calculate_wave_index(ax, ay, az):
@@ -38,12 +51,21 @@ def calculate_wave_index(ax, ay, az):
 def push_ml_results(pred_temp, wave_index):
     """Push prediction to Firebase."""
     ml_result = {
-        "prediction_temp": float(pred_temp),
-        "wave_index": float(wave_index),
+        "predicted_temp": float(pred_temp),
+        "predicted_wave_index": float(wave_index),
         "timestamp": int(time.time())
     }
-    requests.post(FIREBASE_ML_URL, json=ml_result)
-    print("Pushed ML result:", ml_result)
+    try:
+        response = requests.post(
+            FIREBASE_ML_URL,
+            json=ml_result,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        print("Pushed ML result:", ml_result)
+    except requests.RequestException as e:
+        print("Failed to push ML result:", e)
 
 def main_loop():
     while True:
@@ -58,20 +80,29 @@ def main_loop():
         y = df['temperature']
         
         # Train or update model
-        model.fit(X, y)
-        joblib.dump(model, "buoy_model.pkl")  # Save updated model
+        try:
+            model.fit(X, y)
+            joblib.dump(model, "buoy_model.pkl")  # Save updated model
+        except Exception as e:
+            print("Error training model:", e)
+            time.sleep(60)
+            continue
         
         # Predict latest row
-        latest = X.iloc[-1].values.reshape(1, -1)
-        pred_temp = model.predict(latest)[0]
-        wave_index = calculate_wave_index(*latest[0][:3])  # ax, ay, az
+        try:
+            latest = X.iloc[-1].values.reshape(1, -1)
+            pred_temp = model.predict(latest)[0]
+            wave_index = calculate_wave_index(*latest[0][:3])  # ax, ay, az
+            
+            # Push to Firebase
+            push_ml_results(pred_temp, wave_index)
+        except Exception as e:
+            print("Error predicting or pushing ML results:", e)
         
-        # Push to Firebase
-        push_ml_results(pred_temp, wave_index)
-        
-        
-        time.sleep(300)  
+        print("Waiting a  minute until next update...")
+        time.sleep(60)  # 5 minutes
 
 if __name__ == "__main__":
     print("Starting Buoy ML System...")
     main_loop()
+
